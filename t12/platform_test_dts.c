@@ -17,14 +17,20 @@
 *	other bits: reserved;
 * 2.2. Data size Register @offset 4: - Contain data size from device (0..4095);
 */
- #define MEM_SIZE	(4096)
+#define MEM_SIZE	(4096)
+#define WR_OFF		(8192)
 #define REG_SIZE	(8)
 #define DEVICE_POOLING_TIME_MS (500) /*500 ms*/
+#define DEVICE_TRYING_TIME_MS (7) /*7 ms*/
 /**/
-#define PLAT_IO_FLAG_REG		(0) /*Offset of flag register*/
-#define PLAT_IO_SIZE_REG		(4) /*Offset of flag register*/
+#define PLAT_IO_FLAG_REG		(0) /*Offset of read flag register*/
+#define PLAT_IO_SIZE_REG		(4) /*Offset of read size register*/
+#define PLAT_WR_FLAG_REG		(8) /*Offset of write flag register*/
+#define PLAT_WR_SIZE_REG		(12) /*Offset of write size register*/
+/* use of separate read and write flag registers is Traditional */
 #define PLAT_IO_DATA_READY	(1) /*IO data ready flag */
-#define MAX_DUMMY_PLAT_THREADS 1 /*Maximum amount of threads for this */
+#define PLAT_WR_START		(1) /*IO write start command */
+#define MAX_DUMMY_PLAT_THREADS 1 /*Maximum amount of threads for each WQ */
 
 
 struct plat_dummy_device {
@@ -33,6 +39,11 @@ struct plat_dummy_device {
 	struct delayed_work     dwork;
 	struct workqueue_struct *data_read_wq;
 	u64 js_pool_time;
+	/* be compatible with previous version */
+	void __iomem *wrmem;
+	struct delayed_work     wr_dwork;
+	struct workqueue_struct *data_write_wq;
+	u64 js_try_time;
 };
 
 static u32 plat_dummy_mem_read8(struct plat_dummy_device *my_dev, u32 offset)
@@ -40,11 +51,19 @@ static u32 plat_dummy_mem_read8(struct plat_dummy_device *my_dev, u32 offset)
 	return ioread8(my_dev->mem + offset);
 }
 
+static void plat_dummy_mem_write8(struct plat_dummy_device *my_dev,
+	u32 offset, u8 val)
+{
+	iowrite8(val, my_dev->wrmem + offset);
+}
+
 static u32 plat_dummy_reg_read32(struct plat_dummy_device *my_dev, u32 offset)
 {
 	return ioread32(my_dev->regs + offset);
 }
-static void plat_dummy_reg_write32(struct plat_dummy_device *my_dev, u32 offset, u32 val)
+
+static void plat_dummy_reg_write32(struct plat_dummy_device *my_dev,
+	u32 offset, u32 val)
 {
 	iowrite32(val, my_dev->regs + offset);
 }
@@ -77,6 +96,41 @@ static void plat_dummy_work(struct work_struct *work)
 
 	}
 	queue_delayed_work(my_device->data_read_wq, &my_device->dwork, my_device->js_pool_time);
+}
+
+static void plat_dummy_write_work(struct work_struct *work)
+{
+	struct plat_dummy_device *my_device;
+	u32 i, size, status;
+	u8 data;
+
+	char tmpbuf[32];
+
+	pr_info("++%s(%d)\n", __func__, jiffies_to_msecs(jiffies));
+
+	my_device = container_of(work, struct plat_dummy_device, wr_dwork.work);
+	status = plat_dummy_reg_read32(my_device, PLAT_WR_FLAG_REG);
+
+	if (!(status & PLAT_WR_START)) {
+		size = snprintf(tmpbuf, 30, "%lu", jiffies);
+		pr_info("%s: size = %d\n", __func__, size);
+
+		if (size > 31)
+			size = 0; /* some error occured */
+
+		for(i = 0; i < size; i++) {
+			data = tmpbuf[i];
+			plat_dummy_mem_write8(my_device, i, data);
+			pr_info("%s: mem[%d] = 0x%x ('%c')\n", __func__,  i, data, data);
+		}
+
+		plat_dummy_reg_write32(my_device, PLAT_WR_SIZE_REG, size);
+		mb();
+		status |= PLAT_WR_START;
+		plat_dummy_reg_write32(my_device, PLAT_WR_FLAG_REG, status);
+
+	}
+	queue_delayed_work(my_device->data_write_wq, &my_device->wr_dwork, my_device->js_try_time);
 }
 
 static const struct of_device_id plat_dummy_of_match[] = {
@@ -119,10 +173,18 @@ static int plat_dummy_probe(struct platform_device *pdev)
 	if (IS_ERR(my_device->regs))
 		return PTR_ERR(my_device->regs);
 
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+	pr_info("res 1 = %llx..%llx\n", res->start, res->end);
+
+	my_device->wrmem = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(my_device->wrmem))
+		return PTR_ERR(my_device->wrmem);
+
 	platform_set_drvdata(pdev, my_device);
 
 	pr_info("Memory mapped to %p\n", my_device->regs);
 	pr_info("Registers mapped to %p\n", my_device->mem);
+	pr_info("Write memory mapped to %p\n", my_device->wrmem);
 
 	/*Init data read WQ*/
 	my_device->data_read_wq = alloc_workqueue("plat_dummy_read",
@@ -134,6 +196,17 @@ static int plat_dummy_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&my_device->dwork, plat_dummy_work);
 	my_device->js_pool_time = msecs_to_jiffies(DEVICE_POOLING_TIME_MS);
 	queue_delayed_work(my_device->data_read_wq, &my_device->dwork, 0);
+
+	/*Init data write WQ*/
+	my_device->data_write_wq = alloc_workqueue("plat_dummy_write",
+					WQ_UNBOUND, MAX_DUMMY_PLAT_THREADS);
+
+	if (!my_device->data_write_wq)
+		return -ENOMEM;
+
+	INIT_DELAYED_WORK(&my_device->wr_dwork, plat_dummy_write_work);
+	my_device->js_try_time = msecs_to_jiffies(DEVICE_TRYING_TIME_MS);
+	queue_delayed_work(my_device->data_write_wq, &my_device->wr_dwork, 0);
 
 	return PTR_ERR_OR_ZERO(my_device->mem);
 }
@@ -148,6 +221,12 @@ static int plat_dummy_remove(struct platform_device *pdev)
 	/* Destroy work Queue */
 		cancel_delayed_work_sync(&my_device->dwork);
 		destroy_workqueue(my_device->data_read_wq);
+	}
+
+	if (my_device->data_write_wq) {
+	/* Destroy work Queue */
+		cancel_delayed_work_sync(&my_device->wr_dwork);
+		destroy_workqueue(my_device->data_write_wq);
 	}
 
         return 0;
@@ -166,6 +245,6 @@ MODULE_DEVICE_TABLE(of, plat_dummy_of_match);
 
 module_platform_driver(plat_dummy_driver);
 
-MODULE_AUTHOR("Vitaliy Vasylskyy <vitaliy.vasylskyy@globallogic.com>");
+MODULE_AUTHOR("Vitaliy Vasylskyy <vitaliy.vasylskyy@globallogic.com> and Sergii Kolisnyk <kolkmail@gmail.com>");
 MODULE_DESCRIPTION("Dummy platform driver");
 MODULE_LICENSE("GPL");
